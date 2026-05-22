@@ -1,7 +1,7 @@
 #!/usr/bin/env python3.8
 # -*- coding: utf-8 -*-
 """
-SEO 排名检测工具 v1.2
+SEO 排名检测工具 v1.3
 - 关键词来源：https://www.san-seo.com.tw/seed.php (XML)
 - 支持引擎：Google / Google TW / Yahoo / Bing / 百度
 - 每条检测结果自动提交至 https://www.san-seo.com.tw/get.php
@@ -13,6 +13,7 @@ import csv
 import json
 import logging
 import os
+import re
 import queue
 import random
 import subprocess
@@ -35,6 +36,34 @@ from tkinter import ttk, messagebox, filedialog
 SEED_URL    = "https://www.san-seo.com.tw/seed.php"
 SUBMIT_URL  = "https://www.san-seo.com.tw/get.php"
 MAX_LOG_LINES = 2000
+DEFAULT_PAGES = 1
+DEFAULT_DELAY = 30.0
+DEFAULT_LIMIT = 0
+
+def _get_config_path() -> Path:
+    """
+    返回配置文件的持久化路径。
+    --onefile 打包后 __file__ 指向临时解压目录（_MEI*），关闭即删除，不能用于持久存储。
+    优先使用 %LOCALAPPDATA%（Win）或 ~/.config（Mac/Linux）下的固定目录。
+    """
+    if sys.platform == "win32":
+        base = Path(os.environ.get("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
+    elif sys.platform == "darwin":
+        base = Path.home() / "Library" / "Application Support"
+    else:
+        base = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
+    config_dir = base / "SEORankChecker"
+    config_dir.mkdir(parents=True, exist_ok=True)
+    return config_dir / "seo_rank_checker_defaults.json"
+
+DEFAULT_CONFIG_FILE = _get_config_path()
+DEFAULT_UI_CONFIG = {
+    "seed_url": SEED_URL,
+    "submit_url": SUBMIT_URL,
+    "delay": DEFAULT_DELAY,
+    "pages": DEFAULT_PAGES,
+    "limit": DEFAULT_LIMIT,
+}
 
 # 各引擎搜索 URL
 ENGINE_SEARCH_URL = {
@@ -96,6 +125,64 @@ class _GuiQueueHandler(logging.Handler):
 
 def _attach_gui_log_handler(q: queue.Queue):
     logger.addHandler(_GuiQueueHandler(q))
+
+
+# ══════════════════════════════════════════════════════════════
+#  默认配置持久化
+# ══════════════════════════════════════════════════════════════
+
+def _clamp_int(value, min_v: int, max_v: int, default: int) -> int:
+    try:
+        val = int(value)
+    except Exception:
+        return default
+    return max(min_v, min(max_v, val))
+
+
+def _clamp_float(value, min_v: float, max_v: float, default: float) -> float:
+    try:
+        val = float(value)
+    except Exception:
+        return default
+    return max(min_v, min(max_v, val))
+
+
+def _normalize_ui_config(raw: dict) -> dict:
+    cfg = DEFAULT_UI_CONFIG.copy()
+
+    seed_url = raw.get("seed_url")
+    if isinstance(seed_url, str) and seed_url.strip():
+        cfg["seed_url"] = seed_url.strip()
+
+    submit_url = raw.get("submit_url")
+    if isinstance(submit_url, str):
+        cfg["submit_url"] = submit_url.strip()
+
+    cfg["pages"] = _clamp_int(raw.get("pages"), 1, 20, DEFAULT_PAGES)
+    cfg["delay"] = _clamp_float(raw.get("delay"), 1.0, 120.0, DEFAULT_DELAY)
+    cfg["limit"] = _clamp_int(raw.get("limit"), 0, 9999, DEFAULT_LIMIT)
+    return cfg
+
+
+def load_default_ui_config():
+    cfg = DEFAULT_UI_CONFIG.copy()
+    if not DEFAULT_CONFIG_FILE.exists():
+        return cfg, False
+    try:
+        with open(DEFAULT_CONFIG_FILE, "r", encoding="utf-8") as f:
+            raw = json.load(f)
+        if not isinstance(raw, dict):
+            raise ValueError("默认配置文件格式错误（应为 JSON 对象）")
+        return _normalize_ui_config(raw), True
+    except Exception as e:
+        logger.warning(f"读取默认配置失败，改用内置默认配置: {e}")
+        return cfg, False
+
+
+def save_default_ui_config(cfg: dict):
+    safe_cfg = _normalize_ui_config(cfg if isinstance(cfg, dict) else {})
+    with open(DEFAULT_CONFIG_FILE, "w", encoding="utf-8") as f:
+        json.dump(safe_cfg, f, ensure_ascii=False, indent=2)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -409,6 +496,37 @@ def search_google_tw(driver, keyword, target_domain, max_pages=1):
     )
 
 
+def _yahoo_is_ad_result(h3) -> bool:
+    """Yahoo 搜索结果里，尽量过滤广告/赞助条目。"""
+    ad_text_tokens = ("廣告", "广告", "贊助", "赞助", "sponsored")
+    ad_attr_pattern = re.compile(
+        r"(?<![a-z0-9])(ads?|sponsored|sponsor|promo|promotion|advert|"
+        r"advertisement|native-ad|search-ad|yads)(?![a-z0-9])",
+        re.IGNORECASE,
+    )
+
+    for node in (h3, *h3.parents):
+        if not getattr(node, "name", None):
+            continue
+
+        text = " ".join(
+            str(v)
+            for attr in ("class", "id", "role", "aria-label", "data-ylk", "data-test")
+            for v in (
+                node.get(attr) if isinstance(node.get(attr), list) else [node.get(attr)]
+            )
+            if v
+        ).lower()
+        full_text = node.get_text(" ", strip=True).lower()
+
+        if any(token.lower() in full_text for token in ad_text_tokens):
+            return True
+        if ad_attr_pattern.search(text):
+            return True
+
+    return False
+
+
 def search_yahoo(driver, keyword: str, target_domain: str, max_pages: int = 1) -> dict:
     from bs4 import BeautifulSoup
 
@@ -454,11 +572,14 @@ def search_yahoo(driver, keyword: str, target_domain: str, max_pages: int = 1) -
             rank_global += 1
             if target_clean in _extract_domain(href) or \
                _extract_domain(href) in target_clean:
+                matched_rank = rank_global
+                if page == 1 and matched_rank > 10:
+                    matched_rank = 10
                 logger.info(
-                    f"  [Yahoo] ✓ 「{keyword}」排名 #{rank_global}"
+                    f"  [Yahoo] ✓ 「{keyword}」排名 #{matched_rank}"
                     f"（第{page}页）{href[:70]}"
                 )
-                return {"rank": rank_global, "page": page, "url": href, "note": ""}
+                return {"rank": matched_rank, "page": page, "url": href, "note": ""}
 
         logger.debug(f"  [Yahoo] 第{page}页解析{page_rank}条，未匹配")
         if page_rank == 0:
@@ -722,6 +843,7 @@ class _HoverButton(tk.Button):
 class SEOCheckerApp(tk.Tk):
 
     COL_DEFS = [
+        ("picked",     "选",        52,  "center"),
         ("id",         "#",         46,  "center"),
         ("keyword",    "关键词",   130,  "w"),
         ("domain",     "目标域名", 155,  "w"),
@@ -733,6 +855,11 @@ class SEOCheckerApp(tk.Tk):
         ("submitted",  "已提交",    60,  "center"),
         ("checked_at", "检测时间", 135,  "center"),
     ]
+    COL_INDEX = {col[0]: idx for idx, col in enumerate(COL_DEFS)}
+    CHECK_ON = "☑"
+    CHECK_OFF = "☐"
+    PICK_HEADER_ALL = "全选"
+    PICK_HEADER_NONE = "取消全选"
 
     STATUS_COLORS = {
         "running": "#2563eb",
@@ -751,8 +878,8 @@ class SEOCheckerApp(tk.Tk):
 
     def __init__(self):
         super().__init__()
-        self.title("SEO 排名检测工具 v1.2")
-        self.geometry("1160x880")
+        self.title("SEO 排名检测工具 V1.3")
+        self.geometry("1000x700")
         self.minsize(960, 680)
         self.configure(bg="#f0f4f8")
 
@@ -764,10 +891,11 @@ class SEOCheckerApp(tk.Tk):
 
         _attach_gui_log_handler(self._task_queue)
         self._build_ui()
+        self._apply_default_ui_config()
         self._poll_queue()
 
         logger.info("=" * 60)
-        logger.info("SEO 排名检测工具 v1.2  启动")
+        logger.info("SEO 排名检测工具 V1.3  启动")
         logger.info(f"日志文件: {_LOG_FILE}")
         logger.info("=" * 60)
 
@@ -792,7 +920,7 @@ class SEOCheckerApp(tk.Tk):
         tk.Label(bar, text=f"日志: {_LOG_FILE.name}",
                  bg="#1e3a8a", fg="#93c5fd",
                  font=("Helvetica", 9)).pack(side="right", padx=18)
-        tk.Label(bar, text="v1.2",
+        tk.Label(bar, text="V1.3",
                  bg="#1e3a8a", fg="#6b9cd8",
                  font=("Helvetica", 9)).pack(side="right", padx=4)
 
@@ -855,9 +983,9 @@ class SEOCheckerApp(tk.Tk):
                 kw["format"] = fmt
             ttk.Spinbox(parent, **kw).pack(side="left", padx=(0, 18))
 
-        self._var_pages = tk.IntVar(value=1)
-        self._var_delay = tk.DoubleVar(value=30.0)
-        self._var_limit = tk.IntVar(value=0)
+        self._var_pages = tk.IntVar(value=DEFAULT_PAGES)
+        self._var_delay = tk.DoubleVar(value=DEFAULT_DELAY)
+        self._var_limit = tk.IntVar(value=DEFAULT_LIMIT)
 
         _spin_group(r1, "每引擎翻页数:", self._var_pages, 1, 20, 1, 5, lbl_width=10)
         _spin_group(r1, "关键词间隔(秒):", self._var_delay, 1, 120, 1.0, 6, "%.1f")
@@ -914,6 +1042,12 @@ class SEOCheckerApp(tk.Tk):
         tk.Label(r3, text="(每条检测完成后自动 GET 提交)",
                  bg="#f0f4f8", fg="#94a3b8",
                  font=("Helvetica", 9)).pack(side="left")
+        _HoverButton(
+            r3, bg_normal="#2563eb", bg_hover="#1d4ed8",
+            text="💾 保存为默认配置", fg="white",
+            font=("Helvetica", 10), padx=8, pady=3,
+            command=self._save_default_config
+        ).pack(side="left", padx=(12, 0))
 
     # ── 工具栏 ────────────────────────────────────────────────
 
@@ -995,7 +1129,7 @@ class SEOCheckerApp(tk.Tk):
         style = ttk.Style()
         style.theme_use("clam")
         style.configure("Treeview",
-                         font=("Helvetica", 10), rowheight=26,
+                         font=("Helvetica", 11), rowheight=30,
                          background="#ffffff", fieldbackground="#ffffff",
                          foreground="#1e293b")
         style.configure("Treeview.Heading",
@@ -1009,6 +1143,8 @@ class SEOCheckerApp(tk.Tk):
                                    selectmode="browse")
         for cid, label, width, anchor in self.COL_DEFS:
             self._tree.heading(cid, text=label, anchor="center")
+            if cid == "picked":
+                self._tree.heading(cid, command=self._toggle_all_picks)
             self._tree.column(cid, width=width, anchor=anchor,
                                stretch=(cid == "url"))
 
@@ -1023,7 +1159,9 @@ class SEOCheckerApp(tk.Tk):
         vsb.pack(side="right",  fill="y")
         hsb.pack(side="bottom", fill="x")
         self._tree.pack(fill="both", expand=True)
+        self._tree.bind("<Button-1>", self._on_tree_click)
         self._tree.bind("<Double-1>", self._on_double_click)
+        self._refresh_pick_header()
 
         # 下：日志面板
         log_frame = tk.Frame(paned, bg="#0f172a")
@@ -1127,6 +1265,51 @@ class SEOCheckerApp(tk.Tk):
                 h.setLevel(level_int)
         logger.info(f"GUI 日志级别切换为 {self._var_log_level.get()}")
 
+    def _collect_ui_config(self) -> dict:
+        try:
+            pages = self._var_pages.get()
+        except Exception:
+            pages = DEFAULT_PAGES
+        try:
+            delay = self._var_delay.get()
+        except Exception:
+            delay = DEFAULT_DELAY
+        try:
+            limit = self._var_limit.get()
+        except Exception:
+            limit = DEFAULT_LIMIT
+        seed_url = self._var_seed_url.get().strip()
+        submit_url = self._var_submit_url.get().strip()
+        return {
+            "seed_url": seed_url or SEED_URL,
+            "submit_url": submit_url,
+            "delay": delay,
+            "pages": pages,
+            "limit": limit,
+        }
+
+    def _apply_default_ui_config(self):
+        cfg, loaded = load_default_ui_config()
+        self._var_seed_url.set(cfg["seed_url"])
+        self._var_submit_url.set(cfg["submit_url"])
+        self._var_delay.set(cfg["delay"])
+        self._var_pages.set(cfg["pages"])
+        self._var_limit.set(cfg["limit"])
+        if loaded:
+            logger.info(f"已加载默认配置: {DEFAULT_CONFIG_FILE}")
+
+    def _save_default_config(self):
+        cfg = self._collect_ui_config()
+        try:
+            save_default_ui_config(cfg)
+            self._set_status("默认配置已保存", "done")
+            logger.info(f"默认配置已保存: {DEFAULT_CONFIG_FILE}")
+            messagebox.showinfo("提示", "默认配置已保存，下次打开将自动加载")
+        except Exception as e:
+            logger.error(f"保存默认配置失败: {e}")
+            self._set_status("保存默认配置失败", "error")
+            messagebox.showerror("保存失败", str(e))
+
     # ── 加载关键词 ────────────────────────────────────────────
 
     def _load_keywords(self):
@@ -1152,6 +1335,17 @@ class SEOCheckerApp(tk.Tk):
         if not self._keywords:
             messagebox.showwarning("提示", "请先点击【加载关键词】")
             return
+        selected_ids = self._get_checked_keyword_ids()
+        if not selected_ids:
+            messagebox.showwarning("提示", "请至少勾选一个关键词")
+            return
+        selected_keywords = [
+            item for item in self._keywords
+            if str(item.get("id", "")) in selected_ids
+        ]
+        if not selected_keywords:
+            messagebox.showwarning("提示", "当前勾选关键词无有效数据，请重新加载关键词")
+            return
         engines = [k for k, v in self._engine_vars.items() if v.get()]
         if not engines:
             messagebox.showwarning("提示", "请至少勾选一个搜索引擎")
@@ -1166,7 +1360,7 @@ class SEOCheckerApp(tk.Tk):
 
         submit_url = self._var_submit_url.get().strip()
         params = {
-            "keywords":   self._keywords,
+            "keywords":   selected_keywords,
             "engines":    engines,
             "pages":      self._var_pages.get(),
             "delay":      self._var_delay.get(),
@@ -1177,7 +1371,7 @@ class SEOCheckerApp(tk.Tk):
         logger.info(
             f"引擎: {', '.join(ENGINE_META[e][0] for e in engines)}  "
             f"翻页数: {params['pages']}  间隔: {params['delay']}s  "
-            f"关键词数: {len(self._keywords)}"
+            f"关键词数: {len(selected_keywords)}/{len(self._keywords)}"
         )
         logger.info(f"提交接口: {submit_url or SUBMIT_URL}")
         logger.info("═" * 56)
@@ -1327,10 +1521,11 @@ class SEOCheckerApp(tk.Tk):
                     d = data
                     row_id = d["row_id"]
                     if self._tree.exists(row_id):
+                        picked = self._get_row_pick_mark(row_id)
                         self._tree.item(
                             row_id, tags=("checking",),
                             values=(
-                                d["id"], d["keyword"], d["domain"],
+                                picked, d["id"], d["keyword"], d["domain"],
                                 d["engine"], "…", "…", "", "检测中", "…",
                                 datetime.now().strftime("%H:%M:%S")
                             )
@@ -1344,8 +1539,9 @@ class SEOCheckerApp(tk.Tk):
                     tag = ("found"
                            if isinstance(r["rank"], int) and r["rank"] > 0
                            else "notfound")
+                    picked = self._get_row_pick_mark(row_id)
                     vals = (
-                        r.get("id", ""), r["keyword"], r["domain"],
+                        picked, r.get("id", ""), r["keyword"], r["domain"],
                         r["engine"], r["rank"], r["page"],
                         r["url"][:80] if r["url"] else "",
                         r["note"], r.get("submitted", ""),
@@ -1395,18 +1591,101 @@ class SEOCheckerApp(tk.Tk):
                 self._tree.insert(
                     "", "end", iid=row_id,
                     values=(
-                        item["id"], item["keyword"], item["domain"],
+                        self.CHECK_ON, item["id"], item["keyword"], item["domain"],
                         eng_label, "-", "-", "", "待检测", "-", ""
                     ),
                     tags=("",)
                 )
+        self._refresh_pick_header()
+
+    def _get_row_pick_mark(self, row_id: str) -> str:
+        if not self._tree.exists(row_id):
+            return self.CHECK_ON
+        vals = self._tree.item(row_id, "values")
+        idx = self.COL_INDEX["picked"]
+        if len(vals) <= idx:
+            return self.CHECK_ON
+        return self.CHECK_ON if vals[idx] == self.CHECK_ON else self.CHECK_OFF
+
+    def _set_row_pick_mark(self, row_id: str, picked: bool):
+        if not self._tree.exists(row_id):
+            return
+        vals = list(self._tree.item(row_id, "values"))
+        idx = self.COL_INDEX["picked"]
+        if len(vals) <= idx:
+            return
+        vals[idx] = self.CHECK_ON if picked else self.CHECK_OFF
+        self._tree.item(row_id, values=tuple(vals))
+
+    def _all_rows_picked(self) -> bool:
+        rows = self._tree.get_children()
+        if not rows:
+            return False
+        idx_pick = self.COL_INDEX["picked"]
+        for row_id in rows:
+            vals = self._tree.item(row_id, "values")
+            if len(vals) <= idx_pick or vals[idx_pick] != self.CHECK_ON:
+                return False
+        return True
+
+    def _refresh_pick_header(self):
+        if not hasattr(self, "_tree"):
+            return
+        text = self.PICK_HEADER_NONE if self._all_rows_picked() else self.PICK_HEADER_ALL
+        self._tree.heading("picked", text=text, command=self._toggle_all_picks)
+
+    def _get_checked_keyword_ids(self) -> set:
+        checked = set()
+        idx_pick = self.COL_INDEX["picked"]
+        idx_id = self.COL_INDEX["id"]
+        for row_id in self._tree.get_children():
+            vals = self._tree.item(row_id, "values")
+            if len(vals) <= idx_id:
+                continue
+            if vals[idx_pick] == self.CHECK_ON:
+                checked.add(str(vals[idx_id]))
+        return checked
+
+    def _on_tree_click(self, event):
+        col = self._tree.identify_column(event.x)
+        row_id = self._tree.identify_row(event.y)
+        if not row_id or col != "#1":
+            return
+
+        vals = self._tree.item(row_id, "values")
+        idx_id = self.COL_INDEX["id"]
+        if len(vals) <= idx_id:
+            return "break"
+
+        keyword_id = str(vals[idx_id])
+        checked_now = self._get_row_pick_mark(row_id) == self.CHECK_ON
+        next_checked = not checked_now
+        for rid in self._tree.get_children():
+            rvals = self._tree.item(rid, "values")
+            if len(rvals) <= idx_id:
+                continue
+            if str(rvals[idx_id]) == keyword_id:
+                self._set_row_pick_mark(rid, next_checked)
+        self._refresh_pick_header()
+        return "break"
+
+    def _toggle_all_picks(self):
+        rows = self._tree.get_children()
+        if not rows:
+            return
+        next_checked = not self._all_rows_picked()
+        for rid in rows:
+            self._set_row_pick_mark(rid, next_checked)
+        self._refresh_pick_header()
+        return "break"
 
     def _on_double_click(self, _event):
         sel = self._tree.selection()
         if not sel:
             return
         vals = self._tree.item(sel[0], "values")
-        url = vals[6] if len(vals) > 6 else ""
+        idx = self.COL_INDEX["url"]
+        url = vals[idx] if len(vals) > idx else ""
         if url:
             self.clipboard_clear()
             self.clipboard_append(url)
@@ -1418,6 +1697,7 @@ class SEOCheckerApp(tk.Tk):
         self._results.clear()
         self._progress_var.set(0)
         self._lbl_progress.config(text="0 / 0")
+        self._refresh_pick_header()
         self._set_status("已清空结果", "idle")
         logger.info("结果已清空")
 
